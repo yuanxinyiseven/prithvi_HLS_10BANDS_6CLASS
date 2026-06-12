@@ -50,21 +50,14 @@ class MultiTemporalCropClassification(NonGeoDataset):
         "Band_6",
     )
 
-    # class_names = (
-    #     "Natural Vegetation",
-    #     "Forest",
-    #     "Corn",
-    #     "Soybeans",
-    #     "Wetlands",
-    #     "Developed / Barren",
-    #     "Open Water",
-    #     "Winter Wheat",
-    #     "Alfalfa",
-    #     "Fallow / Idle Cropland",
-    #     "Cotton",
-    #     "Sorghum",
-    #     "Other",
-    # )
+    class_names = (
+        "forest",
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4",
+        "Nonforest",
+    )
 
     # rgb_bands = ("RED", "GREEN", "BLUE")
 
@@ -282,6 +275,62 @@ class MultiTemporalCropClassification(NonGeoDataset):
     #     return torch.tensor(lat_lon, dtype=torch.float32)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        sample_info = self.index[index]
+    
+        # === 关键修复：禁用所有日志以避免编码问题 ===
+        import logging
+        import os
+        from pathlib import Path
+    
+        # 完全禁用 rasterio 和 GDAL 日志
+        logging.getLogger("rasterio").setLevel(logging.CRITICAL)
+        logging.getLogger("fiona").setLevel(logging.CRITICAL)
+    
+        # 禁用 GDAL 警告和错误输出到日志
+        os.environ['GDAL_DISABLE_READDIR_ON_OPEN'] = 'YES'
+        os.environ['CPL_DEBUG'] = 'OFF'
+        os.environ['GDAL_CACHEMAX'] = '0'
+    
+        label_path = str(sample_info["label_path"])
+    
+        try:
+            # 使用最小化的 rasterio 环境
+            import rasterio
+            import rioxarray
+        
+            with rasterio.Env(
+                GDAL_DISABLE_READDIR_ON_OPEN='YES',
+                GDAL_CACHEMAX=0,
+                GDAL_NUM_THREADS='1',
+                CPL_DEBUG=False
+            ):
+                # 禁用该次调用的日志
+                old_logger = logging.getLogger('rasterio._env')
+                old_level = old_logger.level
+                old_logger.setLevel(logging.CRITICAL)
+                old_logger.disabled = True
+            
+                try:
+                    mask_data = rioxarray.open_rasterio(label_path, masked=True)
+                finally:
+                    old_logger.disabled = False
+                    old_logger.setLevel(old_level)
+                
+        except Exception as e:
+            print(f"Error reading {label_path}: {e}")
+            # 降级处理：使用 GDAL 的 Python 绑定直接读取
+            from osgeo import gdal
+            gdal.UseExceptions()
+            ds = gdal.Open(label_path)
+            if ds is None:
+                raise RuntimeError(f"Cannot open file: {label_path}")
+            band = ds.GetRasterBand(1)
+            mask_data = band.ReadAsArray()
+            ds = None
+            raise
+    
+        if self.no_label_replace is not None:
+            mask_data = mask_data.fillna(self.no_label_replace)
         # image = self._load_file(self.image_files[index], nan_replace=self.no_data_replace)
 
         # location_coords, temporal_coords = None, None
@@ -301,17 +350,16 @@ class MultiTemporalCropClassification(NonGeoDataset):
         # # filter bands
         # image = image[..., self.band_indices]
 
-
-
-
-        sample_info = self.samples_list[index]
-
-        # 在读取前，再次确保当前线程的日志器被关闭
-        import logging
-        logging.getLogger("rasterio").setLevel(logging.ERROR)
         
         # 1. 读取标签 Mask (确保路径转换为标准字符串型，防止 Path 对象传进 C++ 乱码)
-        mask_data = rioxarray.open_rasterio(str(sample_info["label_path"]), masked=True)
+        import rasterio
+        from rasterio.env import Env
+
+        # 用 rasterio 的本地 path 处理来避免编码问题
+        label_path = str(sample_info["label_path"])
+
+        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN='YES', GDAL_CACHEMAX=0):
+            mask_data = rioxarray.open_rasterio(label_path, masked=True)
         if self.no_label_replace is not None:
             mask_data = mask_data.fillna(self.no_label_replace)
         mask = mask_data.to_numpy()[0].astype(np.int64) # 取出第一通道，形状变成 [H, W]
