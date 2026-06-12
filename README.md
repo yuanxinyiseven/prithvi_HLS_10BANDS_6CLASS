@@ -1,0 +1,1 @@
+# prithvi_HLS_10BANDS_6CLASS
