@@ -16,13 +16,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-import albumentations as A
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from einops import rearrange
+import torchvision.transforms.functional as F
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from torch import Tensor
@@ -33,6 +32,60 @@ from osgeo import gdal
 
 
 from terratorch.datasets.utils import default_transform, filter_valid_files, to_rgb, validate_bands
+
+
+class TemporalTransforms:
+    """
+    支持 4D 时序数据 [C, T, H, W] 的 Transform 类
+    """
+    
+    def __init__(self, do_flip=True, do_rotate=False, normalize=True):
+        """
+        Args:
+            do_flip: 是否随机翻转
+            do_rotate: 是否随机旋转（0/90/180/270）
+            normalize: 是否归一化到 [0, 1]
+        """
+        self.do_flip = do_flip
+        self.do_rotate = do_rotate
+        self.normalize = normalize
+    
+    def __call__(self, data: dict) -> dict:
+        """
+        Args:
+            data: {'image': [C, T, H, W], 'mask': [H, W]}
+        
+        Returns:
+            data: 同上，但已应用 transform
+        """
+        image = data['image']  # [C, T, H, W]
+        mask = data['mask']    # [H, W]
+        
+        # 水平翻转
+        if self.do_flip and np.random.rand() > 0.5:
+            image = torch.flip(image, dims=(-1,))  # 沿 W 维度翻转
+            mask = torch.flip(mask, dims=(-1,))
+        
+        # 竖直翻转
+        if self.do_flip and np.random.rand() > 0.5:
+            image = torch.flip(image, dims=(-2,))  # 沿 H 维度翻转
+            mask = torch.flip(mask, dims=(-2,))
+        
+        # 随机旋转 (0/90/180/270)
+        if self.do_rotate and np.random.rand() > 0.5:
+            k = np.random.randint(1, 4)  # 1=90°, 2=180°, 3=270°
+            image = torch.rot90(image, k=k, dims=(-2, -1))
+            mask = torch.rot90(mask, k=k, dims=(-2, -1))
+        
+        # 归一化到 [0, 1]
+        if self.normalize:
+            # 假设输入范围是 [0, 10000] 或类似
+            # 可根据实际数据范围调整
+            image = image / image.max() if image.max() > 0 else image
+        
+        data['image'] = image
+        data['mask'] = mask
+        return data
 
 
 class MultiTemporalCropClassification(NonGeoDataset):
@@ -52,6 +105,11 @@ class MultiTemporalCropClassification(NonGeoDataset):
        - masks: [B, 224, 224]          <- [B, H, W]
     
     这个格式可以直接输入到 Prithvi 模型!
+    
+    Transform 说明:
+    - 使用自定义 TemporalTransforms，支持 4D 时序数据
+    - 包含：水平/竖直翻转、旋转、归一化
+    - 替代了不支持 4D 的 Albumentations
     """
     # 显式指出前 6 个波段名（对应 Prithvi 所需的 B, G, R, NIR, SWIR1, SWIR2）
     all_band_names = (
@@ -72,29 +130,20 @@ class MultiTemporalCropClassification(NonGeoDataset):
         "Nonforest",
     )
 
-    # rgb_bands = ("RED", "GREEN", "BLUE")
-
-    # BAND_SETS = {"all": all_band_names, "rgb": rgb_bands}
-
     num_classes = 6
     time_steps = 12
     num_bands = 6
-    # splits = {"train": "training", "val": "validation"}  # Only train and val splits available
-    # col_name = "chip_id"
-    # date_columns = ["first_img_date", "middle_img_date", "last_img_date"]
 
     def __init__(
         self,
         data_root: str,
         split: str = "train",
         bands: Sequence[str] = all_band_names,
-        transform: A.Compose | None = None,
+        transform: bool = True,  # 简化为 bool 类型
         no_data_replace: float | None = 0.0,
         no_label_replace: int | None = -1,
         expand_temporal_dimension: bool = True,
-        reduce_zero_label: bool = False, # 【改】默认为 False，防止类别0被减一变成-1
-        # use_metadata: bool = False,
-        # metadata_file_name: str = "chips_df.csv",
+        reduce_zero_label: bool = False,
     ) -> None:
         """Constructor
 
@@ -102,25 +151,16 @@ class MultiTemporalCropClassification(NonGeoDataset):
             data_root (str): Path to the data root directory.
             split (str): one of 'train' or 'val'.
             bands (list[str]): Bands that should be output by the dataset. Defaults to all bands.
-            transform (A.Compose | None): Albumentations transform to be applied.
-                Should end with ToTensorV2(). If used through the corresponding data module,
-                should not include normalization. Defaults to None, which applies ToTensorV2().
+            transform (bool): Whether to apply augmentation. Defaults to True.
+                Flip and rotate will be applied if True.
             no_data_replace (float | None): Replace nan values in input images with this value.
-                If None, does no replacement. Defaults to None.
             no_label_replace (int | None): Replace nan values in label with this value.
-                If none, does no replacement. Defaults to None.
-            expand_temporal_dimension (bool): Go from shape (time*channels, h, w) to (channels, time, h, w).
-                Defaults to True.
-            reduce_zero_label (bool): Subtract 1 from all labels. Useful when labels start from 1 instead of the
-                expected 0. Defaults to True.
-            use_metadata (bool): whether to return metadata info (time and location).
+            expand_temporal_dimension (bool): Keep temporal dimension expanded (not used currently).
+            reduce_zero_label (bool): Subtract 1 from all labels.
         """
         super().__init__()
-        # if split not in self.splits:
-        #     msg = f"Incorrect split '{split}', please choose one of {self.splits}."
-        #     raise ValueError(msg)
-        # split_name = self.splits[split]
-        base_root = Path(data_root) # 传入的应该是类似 E:\HLJ_data_10bands_6class_64\train
+        
+        base_root = Path(data_root)
         if split == "train":
             self.data_root = base_root / "train"
         elif split == "val":
@@ -130,52 +170,23 @@ class MultiTemporalCropClassification(NonGeoDataset):
         else:
             raise ValueError(f"未知的 split 类型: {split}. 请选择 'train', 'val' 或 'test'.")
         self.split = split
-        
 
-        # validate_bands(bands, self.all_band_names)
-        # self.bands = bands
-        # self.band_indices = np.asarray([self.all_band_names.index(b) for b in bands])
-        # self.data_root = Path(data_root)
-
-        # data_dir = self.data_root / f"{split_name}_chips"
-        # self.image_files = sorted(glob.glob(os.path.join(data_dir, "*_merged.tif")))
-        # self.segmentation_mask_files = sorted(glob.glob(os.path.join(data_dir, "*.mask.tif")))
-        # split_file = self.data_root / f"{split_name}_data.txt"
-
-        # with open(split_file) as f:
-        #     split = f.readlines()
-        # valid_files = {rf"{substring.strip()}" for substring in split}
-        # valid_files = {
-        #     os.path.basename(f).split(".")[0] for f in self.image_files
-        # }
-        # self.image_files = filter_valid_files(
-        #     self.image_files,
-        #     valid_files=valid_files,
-        #     ignore_extensions=True,
-        #     allow_substring=True,
-        # )
-        # self.segmentation_mask_files = filter_valid_files(
-        #     self.segmentation_mask_files,
-        #     valid_files=valid_files,
-        #     ignore_extensions=True,
-        #     allow_substring=True,
-        # )
         self.no_data_replace = no_data_replace
         self.no_label_replace = no_label_replace
         self.reduce_zero_label = reduce_zero_label
         self.expand_temporal_dimension = expand_temporal_dimension
-        # self.use_metadata = use_metadata
-        # self.metadata = None
-        # self.metadata_file_name = metadata_file_name
-        # if self.use_metadata:
-        #     metadata_file = self.data_root / self.metadata_file_name
-        #     self.metadata = pd.read_csv(metadata_file)
-        #     self._build_image_metadata_mapping()
 
-        # If no transform is given, apply only to transform to torch tensor
-        self.transform = transform if transform else default_transform
+        # 创建 Transform
+        # 只在 train split 时应用数据增强
+        self.transform = None
+        if transform and split == "train":
+            self.transform = TemporalTransforms(
+                do_flip=True,
+                do_rotate=True,
+                normalize=False  # 不做归一化，保持原始数据范围
+            )
 
-        # ─── 【增】解析文件路径与对齐时序影像 ───
+        # ─── 解析文件路径与对齐时序影像 ───
         self.samples_list = []
         label_root = self.data_root / "label"
         image_root = self.data_root / "Image"
@@ -189,36 +200,27 @@ class MultiTemporalCropClassification(NonGeoDataset):
                 year_match = re.search(r"HLJ(\d{4})", year_dir.name)
                 if not year_match:
                     continue
-                year = year_match.group(1) # 提取年份字符串，如 "2016"
+                year = year_match.group(1)
 
-                # 【调试打印 2】看看找到了哪些年份文件夹
                 print(f"   发现年份文件夹: {year_dir.name} -> 提取年份: {year}")
 
-                # 寻找该年份下的所有标签文件
                 label_files = sorted(year_dir.glob("label_*_*_224.tif"))
                 if not label_files:
                     print(f"   ⚠️ 警告: 在 {year_dir.name} 下没有找到形如 label_*_*_224.tif 的文件！")
 
-                # 寻找该年份下的所有标签文件
                 for label_file in sorted(year_dir.glob("label_*_*_224.tif")):
-                    # 解析文件名，例如 label_2016_1_224.tif
                     filename = label_file.name
                     parts = filename.split("_")
-                    sample_id = parts[2] # 提取样本 ID，如 "1"
-                    img_size = parts[3].split(".")[0] # "224"
+                    sample_id = parts[2]
+                    img_size = parts[3].split(".")[0]
 
-                    # 构建对应的影像文件夹路径
-                    # 规则：HLJ_HLS_PATCHES_2016_clip class_1_HighQuality
                     img_dir_name = f"HLJ_HLS_PATCHES_{year}_clip_class_1_HighQuality"
                     target_img_dir = image_root / img_dir_name
 
                     if not target_img_dir.exists():
-                        # 【调试打印 3】如果是影像文件夹路径没对上，打印出来
                         print(f"   ❌ 找不到影像文件夹: {img_dir_name} (完整路径: {target_img_dir})")
                         continue
 
-                    # 寻找 3 年（前一年、当年、后一年），每年的 Q1-Q4，总共 12 幅影像
-                    # 例如当年是 2016，则找 2015, 2016, 2017
                     center_year = int(year)
                     years_to_find = [center_year - 1, center_year, center_year + 1]
                     quarters = ["Q1", "Q2", "Q3", "Q4"]
@@ -228,20 +230,17 @@ class MultiTemporalCropClassification(NonGeoDataset):
 
                     for y in years_to_find:
                         for q in quarters:
-                            # 构建标准文件名：HLJ_2015_1_Q1_224.tif
                             img_name = f"HLJ_{y}_{sample_id}_{q}_{img_size}.tif"
                             img_path = target_img_dir / img_name
                             if img_path.exists():
                                 temporal_image_paths.append(img_path)
                             else:
-                                # 【调试打印 4】如果是里面的某一个季度 TIF 缺失了，打印出来
                                 print(f"   ❌ 文件夹 {img_dir_name} 内缺少单张影像: {img_name}")
                                 is_valid_sample = False
                                 break
                         if not is_valid_sample:
                             break
 
-                    # 只有当 12 幅影像全部集齐时，才加入训练样本集
                     if is_valid_sample and len(temporal_image_paths) == 12:
                         self.samples_list.append({
                             "label_path": label_file,
@@ -249,44 +248,13 @@ class MultiTemporalCropClassification(NonGeoDataset):
                         })
         else:
             print(f"❌ 错误: label 根目录根本不存在: {label_root}")
+        
         print(f"统计: [{split.upper()}] 阶段成功对齐并加载了 {len(self.samples_list)} 个 12时相样本。\n")
         if len(self.samples_list) == 0:
             print(f"警告: 在 {self.data_root} 未找到任何匹配的 12时相对齐样本！请检查路径规则。")
 
-    # def _build_image_metadata_mapping(self):
-    #     """Build a mapping from image filenames to metadata indices."""
-    #     self.image_to_metadata_index = dict()
-
-    #     for idx, image_file in enumerate(self.image_files):
-    #         image_filename = Path(image_file).name
-    #         image_id = image_filename.replace("_merged.tif", "").replace(".tif", "")
-    #         metadata_indices = self.metadata.index[self.metadata[self.col_name] == image_id].tolist()
-    #         self.image_to_metadata_index[idx] = metadata_indices[0]
-    
     def __len__(self) -> int:
         return len(self.samples_list)
-
-    # def _get_date(self, row: pd.Series) -> torch.Tensor:
-    #     """Extract and format temporal coordinates (T, date) from metadata."""
-    #     temporal_coords = []
-    #     for col in self.date_columns:
-    #         date_str = row[col]
-    #         date = pd.to_datetime(date_str)
-    #         temporal_coords.append([date.year, date.dayofyear - 1])
-
-        return torch.tensor(temporal_coords, dtype=torch.float32)
-
-    # def _get_coords(self, image: DataArray) -> torch.Tensor:
-    #     px = image.x.shape[0] // 2
-    #     py = image.y.shape[0] // 2
-
-    #     # get center point to reproject to lat/lon
-    #     point = image.isel(band=0, x=slice(px, px + 1), y=slice(py, py + 1))
-    #     point = point.rio.reproject("epsg:4326")
-
-    #     lat_lon = np.asarray([point.y[0], point.x[0]])
-
-    #     return torch.tensor(lat_lon, dtype=torch.float32)
 
     @staticmethod
     def _read_tif_with_gdal(file_path: str) -> np.ndarray:
@@ -299,9 +267,7 @@ class MultiTemporalCropClassification(NonGeoDataset):
             if ds is None:
                 raise RuntimeError(f"Cannot open file with GDAL: {file_path}")
             
-            # 获取栅格数据集信息
             band_count = ds.RasterCount
-            data_type = ds.GetRasterBand(1).DataType
             
             # 读取所有波段
             data_list = []
@@ -321,17 +287,13 @@ class MultiTemporalCropClassification(NonGeoDataset):
             gdal.PopErrorHandler()
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        # 【修复】改为 self.samples_list，而不是 self.index
         sample_info = self.samples_list[index]
-        
-        # === 使用纯 GDAL 读取，完全避免 rasterio 的编码问题 ===
         
         label_path = str(sample_info["label_path"])
         
         try:
             # 读取标签
             mask_data = self._read_tif_with_gdal(label_path)
-            # 取第一个波段，形状为 [H, W]
             mask = mask_data[0].astype(np.int64)
         except Exception as e:
             print(f"Error reading label {label_path}: {e}")
@@ -342,48 +304,33 @@ class MultiTemporalCropClassification(NonGeoDataset):
         for img_path in sample_info["image_paths"]:
             try:
                 img_data = self._read_tif_with_gdal(str(img_path))
-                # img_data 形状: [10, H, W]
-                # 【核心修改】只切取前 6 个波段，满足 Prithvi 模型要求
-                img_data = img_data[:6, :, :]  # 形状变成 [6, H, W]
+                # 只切取前 6 个波段
+                img_data = img_data[:6, :, :]
                 time_series_list.append(img_data)
             except Exception as e:
                 print(f"Error reading image {img_path}: {e}")
                 raise
 
         # 堆叠 12 个时相
-        # time_series_list: 12 个 [6, H, W]
-        # stack 后: [12, 6, H, W]
-        image = np.stack(time_series_list, axis=0)
+        image = np.stack(time_series_list, axis=0)  # [12, 6, H, W] = [T, C, H, W]
         
-        # 【核心修改】转换为 Prithvi 期望的格式 [C, T, H, W]
-        # 当前: [12, 6, H, W] 即 [T, C, H, W]
-        # 目标: [6, 12, H, W] 即 [C, T, H, W]
+        # 转换为 Prithvi 期望的格式 [C, T, H, W]
         image = np.transpose(image, (1, 0, 2, 3)).astype(np.float32)
+
+        # 转换为 Tensor
+        image = torch.from_numpy(image).float()  # [6, 12, 224, 224]
+        mask = torch.from_numpy(mask).long()     # [224, 224]
 
         output = {
             "image": image,
             "mask": mask
         }
 
-        # if self.reduce_zero_label:
-        #     output["mask"] -= 1
+        # 应用 Transform（支持 4D 时序数据）
         if self.transform:
-            output = self.transform(**output)
-        output["mask"] = output["mask"].long()
-
-        # if self.use_metadata:
-        #     output["location_coords"] = location_coords
-        #     output["temporal_coords"] = temporal_coords
+            output = self.transform(output)
 
         return output
-
-    def _load_file(self, path: Path, nan_replace: int | float | None = None) -> DataArray:
-        """Legacy method for compatibility"""
-        import rioxarray
-        data = rioxarray.open_rasterio(path, masked=True)
-        if nan_replace is not None:
-            data = data.fillna(nan_replace)
-        return data
 
     def plot(self, sample: dict[str, Tensor], suptitle: str | None = None) -> Figure:
         """Plot a sample from the dataset.
