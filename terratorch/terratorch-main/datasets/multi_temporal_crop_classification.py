@@ -21,7 +21,6 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import rioxarray
 import torch
 from einops import rearrange
 from matplotlib.figure import Figure
@@ -30,6 +29,7 @@ from torch import Tensor
 from torchgeo.datasets import NonGeoDataset
 from xarray import DataArray
 import re
+from osgeo import gdal
 
 
 from terratorch.datasets.utils import default_transform, filter_valid_files, to_rgb, validate_bands
@@ -274,97 +274,64 @@ class MultiTemporalCropClassification(NonGeoDataset):
 
     #     return torch.tensor(lat_lon, dtype=torch.float32)
 
+    @staticmethod
+    def _read_tif_with_gdal(file_path: str) -> np.ndarray:
+        """使用 GDAL 直接读取 TIF 文件，避免 rasterio 的路径编码问题"""
+        gdal.UseExceptions()
+        gdal.PushErrorHandler('CPLQuietErrorHandler')
+        
+        try:
+            ds = gdal.Open(file_path)
+            if ds is None:
+                raise RuntimeError(f"Cannot open file with GDAL: {file_path}")
+            
+            # 获取栅格数据集信息
+            band_count = ds.RasterCount
+            data_type = ds.GetRasterBand(1).DataType
+            
+            # 读取所有波段
+            data_list = []
+            for band_idx in range(1, band_count + 1):
+                band = ds.GetRasterBand(band_idx)
+                band_data = band.ReadAsArray()
+                if band_data is None:
+                    raise RuntimeError(f"Failed to read band {band_idx} from {file_path}")
+                data_list.append(band_data)
+            
+            # 堆叠波段
+            result = np.stack(data_list, axis=0).astype(np.float32)
+            ds = None
+            
+            return result
+        finally:
+            gdal.PopErrorHandler()
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         # 【修复】改为 self.samples_list，而不是 self.index
         sample_info = self.samples_list[index]
-    
-        # === 关键修复：禁用所有日志以避免编码问题 ===
-        import logging
-        import os
-        from pathlib import Path
-        import rasterio
-        import rioxarray
-    
-        # 完全禁用 rasterio 和 GDAL 日志
-        logging.getLogger("rasterio").setLevel(logging.CRITICAL)
-        logging.getLogger("fiona").setLevel(logging.CRITICAL)
-    
-        # 禁用 GDAL 警告和错误输出到日志
-        os.environ['GDAL_DISABLE_READDIR_ON_OPEN'] = 'YES'
-        os.environ['CPL_DEBUG'] = 'OFF'
-        os.environ['GDAL_CACHEMAX'] = '0'
-    
-        label_path = str(sample_info["label_path"])
-    
-        try:
-            with rasterio.Env(
-                GDAL_DISABLE_READDIR_ON_OPEN='YES',
-                GDAL_CACHEMAX=0,
-                GDAL_NUM_THREADS='1',
-                CPL_DEBUG=False
-            ):
-                # 禁用该次调用的日志
-                old_logger = logging.getLogger('rasterio._env')
-                old_level = old_logger.level
-                old_logger.setLevel(logging.CRITICAL)
-                old_logger.disabled = True
-            
-                try:
-                    mask_data = rioxarray.open_rasterio(label_path, masked=True)
-                finally:
-                    old_logger.disabled = False
-                    old_logger.setLevel(old_level)
-                
-        except Exception as e:
-            print(f"Error reading {label_path}: {e}")
-            # 降级处理：使用 GDAL 的 Python 绑定直接读取
-            from osgeo import gdal
-            gdal.UseExceptions()
-            ds = gdal.Open(label_path)
-            if ds is None:
-                raise RuntimeError(f"Cannot open file: {label_path}")
-            band = ds.GetRasterBand(1)
-            mask_data_np = band.ReadAsArray()
-            ds = None
-            # 转换为 numpy array，方便后续处理
-            mask_data = mask_data_np
-    
-        # 处理标签：转换为 numpy 数组
-        if hasattr(mask_data, 'to_numpy'):
-            # xarray DataArray
-            mask = mask_data.to_numpy()[0].astype(np.int64)
-        else:
-            # 已经是 numpy array
-            mask = mask_data.astype(np.int64)
         
-        # 2. 循环读取 12 幅影像
+        # === 使用纯 GDAL 读取，完全避免 rasterio 的编码问题 ===
+        
+        label_path = str(sample_info["label_path"])
+        
+        try:
+            # 读取标签
+            mask_data = self._read_tif_with_gdal(label_path)
+            # 取第一个波段，形状为 [H, W]
+            mask = mask_data[0].astype(np.int64)
+        except Exception as e:
+            print(f"Error reading label {label_path}: {e}")
+            raise
+
+        # 读取 12 幅影像
         time_series_list = []
         for img_path in sample_info["image_paths"]:
             try:
-                with rasterio.Env(
-                    GDAL_DISABLE_READDIR_ON_OPEN='YES',
-                    GDAL_CACHEMAX=0,
-                    GDAL_NUM_THREADS='1',
-                    CPL_DEBUG=False
-                ):
-                    old_logger = logging.getLogger('rasterio._env')
-                    old_level = old_logger.level
-                    old_logger.setLevel(logging.CRITICAL)
-                    old_logger.disabled = True
-                    
-                    try:
-                        img_da = rioxarray.open_rasterio(str(img_path), masked=True)
-                    finally:
-                        old_logger.disabled = False
-                        old_logger.setLevel(old_level)
-                        
-                if self.no_data_replace is not None:
-                    img_da = img_da.fillna(self.no_data_replace)
-                
-                img_np = img_da.to_numpy() # 形状: [10, H, W]
-                # 【核心���改】只切取前 6 个波段，满足 Prithvi 模型要求
-                img_np = img_np[:6, :, :] # 形状变成 [6, H, W]
-                time_series_list.append(img_np)
+                img_data = self._read_tif_with_gdal(str(img_path))
+                # img_data 形状: [10, H, W]
+                # 【核心修改】只切取前 6 个波段，满足 Prithvi 模型要求
+                img_data = img_data[:6, :, :]  # 形状变成 [6, H, W]
+                time_series_list.append(img_data)
             except Exception as e:
                 print(f"Error reading image {img_path}: {e}")
                 raise
@@ -372,7 +339,7 @@ class MultiTemporalCropClassification(NonGeoDataset):
         # 堆叠 12 个时相： 形状从 list 变为 [12, 6, H, W]
         image = np.stack(time_series_list, axis=0)
 
-        # 3. 准备进行 Albumentations 变换
+        # 准备进行 Albumentations 变换
         # Albumentations 要求输入形状为 [H, W, Channels]
         # 先利用 einops 平铺时序通道：[12, 6, H, W] -> [72, H, W]
         image = rearrange(image, "time channels h w -> (time channels) h w")
@@ -397,6 +364,8 @@ class MultiTemporalCropClassification(NonGeoDataset):
         return output
 
     def _load_file(self, path: Path, nan_replace: int | float | None = None) -> DataArray:
+        """Legacy method for compatibility"""
+        import rioxarray
         data = rioxarray.open_rasterio(path, masked=True)
         if nan_replace is not None:
             data = data.fillna(nan_replace)
