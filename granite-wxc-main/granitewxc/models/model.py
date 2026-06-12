@@ -1,0 +1,267 @@
+import torch
+import numpy as np
+
+from granitewxc.utils.config import ExperimentConfig
+from granitewxc.utils.distributed import is_main_process
+from granitewxc.decoders.downscaling import ConvEncoderDecoder
+from granitewxc.models.finetune_model import PatchEmbed
+from granitewxc.models.eccc_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
+from PrithviWxC.model import PrithviWxCEncoderDecoder
+
+
+
+def get_scalers(config: ExperimentConfig):
+    """
+    calls assemble scalers func. 
+    """    
+
+    # Input and target scalers
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if config.data.type == 'eccc':
+        input_mu = torch.load(config.model.input_mu, map_location=device)
+        input_sigma = torch.load(config.model.input_sigma, map_location=device)
+        input_static_mu = torch.load(config.model.input_static_mu, map_location=device)
+        input_static_sigma = torch.load(config.model.input_static_sigma, map_location=device)
+        target_mu = torch.load(config.model.target_mu, map_location=device)
+        target_sigma = torch.load(config.model.target_sigma, map_location=device)
+        target_static_mu = torch.load(config.model.target_static_mu, map_location=device)
+        target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device)
+        
+    else:
+        raise ValueError(f'{config.data.type} is not a valid config.data.type')
+
+    return dict(
+        input_mu=input_mu,
+        input_sigma=input_sigma,
+        input_static_mu=input_static_mu,
+        input_static_sigma=input_static_sigma,
+        target_mu=target_mu,
+        target_sigma=target_sigma,
+        target_static_mu = target_static_mu,
+        target_static_sigma = target_static_sigma
+    )
+
+
+def get_eccc_embedding_module(config: ExperimentConfig):
+    '''
+    n_parameters = n_surface_vars + n_vertical*level
+    in ECCC we have: 
+          n_parameters   =  3 (surface) + 6(other) + 6 (vertical)*5(press) +4(vertical)*3(level1) + 2(vertical)*3 (level_2) = 57
+    '''
+
+    n_parameters = len(config.data.input_surface_vars) + len(config.data.other) + len(
+        config.data.vertical_pres_vars)*len(config.data.input_level_pres) + len(
+        config.data.vertical_level1_vars)*len(config.data.input_level1)+ len(
+        config.data.vertical_level2_vars)*len(config.data.input_level2)
+    
+    patch_embedding = PatchEmbed(
+        patch_size=config.model.downscaling_patch_size,
+        channels=n_parameters * config.data.n_input_timestamps,
+        embed_dim=config.model.downscaling_embed_dim,
+    )
+
+    n_static_parameters = config.model.num_static_channels + len(config.data.input_static_surface_vars)
+    if config.model.residual == 'climate':
+        n_static_parameters += n_parameters
+
+    patch_embedding_static = PatchEmbed(
+        patch_size=config.model.downscaling_patch_size,
+        channels=n_static_parameters,
+        embed_dim=config.model.downscaling_embed_dim,
+    ) 
+        
+    return patch_embedding, patch_embedding_static
+
+    
+#------------------------------
+def get_finetune_model_UNET(config: ExperimentConfig) -> torch.nn.Module:
+    """
+    Args:
+        config: Experiment configuration. Contains configuration parameters for model.
+    Returns:
+        The configured model.
+    """
+
+    if is_main_process():
+        print("Creating the model.")
+
+    #########################################################
+    # 0. Setup parameters/scalers
+    #########################################################
+    # set default kernel size
+    if 'encoder_decoder_kernel_size_per_stage' not in config.model.__dict__:      
+        config.model.encoder_decoder_kernel_size_per_stage = [[3]*len(inner) for inner in config.model.encoder_decoder_scale_per_stage]
+
+    n_output_parameters = len(config.data.output_vars)
+    if config.model.__dict__.get('loss_type', 'patch_rmse_loss')=='cross_entropy':
+        if config.model.__dict__.get('cross_entropy_bin_width_type', 'uniform') == 'uniform':
+            n_output_parameters = config.model.__dict__.get('cross_entropy_n_bins', 512)
+        else:
+            n_output_parameters = len(np.load(config.model.cross_entropy_bin_boundaries_file)) + 1
+
+    scalers = get_scalers(config)
+    
+    #########################################################
+    # 1. Patch Embedding/Shallow Feature Extraction
+    #########################################################
+    if config.data.type == 'eccc':  # eccc
+        embedding, embedding_static = get_eccc_embedding_module(config)
+    else:
+        raise ValueError(f'{config.data.type} is not a valid config.data.type')
+
+    #########################################################
+    # 3. FM/Deep Feature Extraction 
+    #########################################################
+    backbone = PrithviWxCEncoderDecoder(
+        embed_dim=config.model.embed_dim,
+        n_blocks=config.model.n_blocks_encoder,
+        mlp_multiplier=config.model.mlp_multiplier,
+        n_heads=config.model.n_heads,
+        dropout=config.model.dropout_rate,
+        drop_path=config.model.drop_path,
+    )
+
+
+    #########################################################
+    # 5. Putting it all together
+    #########################################################
+    model = ClimateDownscaleFinetuneUNETModel(
+        embedding=embedding,
+        embedding_static=embedding_static,
+        backbone=backbone,
+        input_scalers_mu=scalers['input_mu'],
+        input_scalers_sigma=scalers['input_sigma'],
+        input_scalers_epsilon=1e-6,
+        static_input_scalers_mu=scalers['input_static_mu'],
+        static_input_scalers_sigma=scalers['input_static_sigma'],
+        static_input_scalers_epsilon=1e-6,
+        static_output_scalers_mu = scalers['target_static_mu'], 
+        static_output_scalers_sigma = scalers['target_static_sigma'],
+        output_scalers_mu=scalers['target_mu'],
+        output_scalers_sigma=scalers['target_sigma'],
+        patch_size_px_backbone=(1, 1),
+        n_bins=n_output_parameters, #n_bins: int = 512,
+        scale = [2,2,2], # ----- to be used in  UNET (config.encoder_decoder_scale_per_stage)
+        kernel_size  = [3,3,3], # encoder_decoder_kernel_size_per_stage
+        config = config
+    )
+
+    if is_main_process():
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"--> model has {total_params:,.0f} params.")
+        
+    return model
+
+
+def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
+    """
+    Args:
+        config: Experiment configuration. Contains configuration parameters for model.
+    Returns:
+        The configured model.
+    """
+
+    if is_main_process():
+        print("Creating the model.")
+
+    #########################################################
+    # 0. Setup parameters/scalers
+    #########################################################
+    # set default kernel size
+    if 'encoder_decoder_kernel_size_per_stage' not in config.model.__dict__:      
+        config.model.encoder_decoder_kernel_size_per_stage = [[3]*len(inner) for inner in config.model.encoder_decoder_scale_per_stage]
+
+    n_output_parameters = len(config.data.output_vars)
+    if config.model.__dict__.get('loss_type', 'patch_rmse_loss')=='cross_entropy':
+        if config.model.__dict__.get('cross_entropy_bin_width_type', 'uniform') == 'uniform':
+            n_output_parameters = config.model.__dict__.get('cross_entropy_n_bins', 512)
+        else:
+            n_output_parameters = len(np.load(config.model.cross_entropy_bin_boundaries_file)) + 1
+
+    scalers = get_scalers(config)
+
+    
+    #########################################################
+    # 1. Patch Embedding/Shallow Feature Extraction
+    #########################################################
+    if config.data.type == 'eccc':  # eccc
+        embedding, embedding_static = get_eccc_embedding_module(config)
+    else:
+        raise ValueError(f'{config.data.type} is not a valid config.data.type')
+
+    #########################################################
+    # 2. Upscale before FM 
+    # Keep token resolution similar to trained backbone
+    #########################################################
+    upscale = ConvEncoderDecoder(
+        in_channels=config.model.downscaling_embed_dim,
+        channels=config.model.encoder_decoder_conv_channels,
+        out_channels=config.model.embed_dim,
+        kernel_size=config.model.encoder_decoder_kernel_size_per_stage[0],
+        scale=config.model.encoder_decoder_scale_per_stage[0],
+        upsampling_mode=config.model.encoder_decoder_upsampling_mode,
+    ) 
+    
+    
+    #########################################################
+    # 3. FM/Deep Feature Extraction 
+    #########################################################
+    backbone = PrithviWxCEncoderDecoder(
+        embed_dim=config.model.embed_dim,
+        n_blocks=config.model.n_blocks_encoder,
+        mlp_multiplier=config.model.mlp_multiplier,
+        n_heads=config.model.n_heads,
+        dropout=config.model.dropout_rate,
+        drop_path=config.model.drop_path,
+    )
+
+    #########################################################
+    # 4. Upscale after FM 
+    #########################################################
+    if config.model.encoder_decoder_type == 'conv':
+        head = ConvEncoderDecoder(
+                in_channels=config.model.embed_dim,
+                channels=config.model.encoder_decoder_conv_channels,
+                out_channels=n_output_parameters,
+                kernel_size=config.model.encoder_decoder_kernel_size_per_stage[1],
+                scale=config.model.encoder_decoder_scale_per_stage[1],
+                upsampling_mode=config.model.encoder_decoder_upsampling_mode,
+        )
+    else:
+        raise NotImplementedError(f"Head type {config.model.encoder_decoder_type} not implemented.")
+
+    #########################################################
+    # 5. Putting it all together
+    #########################################################
+    model = ClimateDownscaleFinetuneModel(
+        embedding=embedding,
+        embedding_static=embedding_static,
+        upscale=upscale,
+        backbone=backbone,
+        head=head,
+        input_scalers_mu=scalers['input_mu'],
+        input_scalers_sigma=scalers['input_sigma'],
+        input_scalers_epsilon=1e-6,
+        static_input_scalers_mu=scalers['input_static_mu'],
+        static_input_scalers_sigma=scalers['input_static_sigma'],
+        static_input_scalers_epsilon=1e-6,
+        output_scalers_mu=scalers['target_mu'],
+        output_scalers_sigma=scalers['target_sigma'],
+        n_input_timestamps=config.data.n_input_timestamps,
+        embed_dim_backbone=config.model.embed_dim,
+        encoder_decoder_scale_per_stage=config.model.encoder_decoder_scale_per_stage,
+        patch_size_px_backbone=(1, 1),
+        mask_unit_size_px_backbone=config.mask_unit_size,
+        n_bins=n_output_parameters,
+        return_logits=config.model.__dict__.get('loss_type')=='cross_entropy',
+        residual=config.model.__dict__.get('residual', None),
+        residual_connection=config.model.__dict__.get('residual_connection', False),
+        backbone_use = config.backbone_use
+    )
+
+    if is_main_process():
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"--> model has {total_params:,.0f} params.")
+
+    return model

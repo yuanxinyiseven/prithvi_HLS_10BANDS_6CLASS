@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: granitewxc
+Version: 0.1.1rc1
+Author: Julian Kuehnert, Will Torjak, Johannes Schmude, Daniel Salles Civitarese, Johannes Jakubik, Romeo Kienzler, Victor Nascimento Ribeiro, Jorge Luis Guevara Diaz
+Author-email: Shraddha Singh <shraddha.singh@ibm.com>
+License: Apache License, Version 2.0
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: prithviwxc>=0.1.0
+Requires-Dist: xarray>=2024.9.0
+Requires-Dist: scipy
+Requires-Dist: wget>=1.21.4
+Requires-Dist: pyyaml>=6.0.2
+Requires-Dist: h5netcdf>=1.3.0
+Provides-Extra: examples
+Requires-Dist: notebook~=7.2; extra == "examples"
+Requires-Dist: matplotlib>=3.8; extra == "examples"
+Dynamic: license-file

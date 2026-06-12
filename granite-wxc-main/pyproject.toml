@@ -1,0 +1,53 @@
+[build-system]
+requires = [ "setuptools" ]
+build-backend = 'setuptools.build_meta'
+
+[tool.setuptools.packages.find]
+include = ["granitewxc*"]
+
+
+[project]
+name = "granitewxc"
+version = "0.1.1rc1"
+license = { text = "Apache License, Version 2.0" }
+authors = [
+    {name = "Shraddha Singh", email = "shraddha.singh@ibm.com"},
+    {name = "Julian Kuehnert"},
+    {name = "Will Torjak"},
+    {name = "Johannes Schmude"},
+    {name = "Daniel Salles Civitarese"},
+    {name = "Johannes Jakubik"},  
+    {name = "Romeo Kienzler"},  
+    {name = "Victor Nascimento Ribeiro"},
+    {name = "Jorge Luis Guevara Diaz"},
+]
+classifiers = [
+]
+requires-python = ">=3.10"
+dependencies = [
+    "prithviwxc >= 0.1.0",
+    "xarray >= 2024.9.0",
+    "scipy",
+    "wget >= 1.21.4",
+    "pyyaml >= 6.0.2",
+    "h5netcdf >= 1.3.0"
+]
+
+
+[project.optional-dependencies]
+examples = [
+    "notebook ~= 7.2",
+    "matplotlib >= 3.8",
+]
+
+[tool.ruff]
+line-length = 79
+select = [
+    "C",
+    "F",
+    "E",
+    "W",
+    "B",
+    "I",
+]
+
