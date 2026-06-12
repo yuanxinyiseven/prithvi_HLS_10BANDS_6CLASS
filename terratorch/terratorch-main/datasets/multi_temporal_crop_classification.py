@@ -275,12 +275,15 @@ class MultiTemporalCropClassification(NonGeoDataset):
     #     return torch.tensor(lat_lon, dtype=torch.float32)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        sample_info = self.index[index]
+        # 【修复】改为 self.samples_list，而不是 self.index
+        sample_info = self.samples_list[index]
     
         # === 关键修复：禁用所有日志以避免编码问题 ===
         import logging
         import os
         from pathlib import Path
+        import rasterio
+        import rioxarray
     
         # 完全禁用 rasterio 和 GDAL 日志
         logging.getLogger("rasterio").setLevel(logging.CRITICAL)
@@ -294,10 +297,6 @@ class MultiTemporalCropClassification(NonGeoDataset):
         label_path = str(sample_info["label_path"])
     
         try:
-            # 使用最小化的 rasterio 环境
-            import rasterio
-            import rioxarray
-        
             with rasterio.Env(
                 GDAL_DISABLE_READDIR_ON_OPEN='YES',
                 GDAL_CACHEMAX=0,
@@ -325,56 +324,50 @@ class MultiTemporalCropClassification(NonGeoDataset):
             if ds is None:
                 raise RuntimeError(f"Cannot open file: {label_path}")
             band = ds.GetRasterBand(1)
-            mask_data = band.ReadAsArray()
+            mask_data_np = band.ReadAsArray()
             ds = None
-            raise
+            # 转换为 numpy array，方便后续处理
+            mask_data = mask_data_np
     
-        if self.no_label_replace is not None:
-            mask_data = mask_data.fillna(self.no_label_replace)
-        # image = self._load_file(self.image_files[index], nan_replace=self.no_data_replace)
-
-        # location_coords, temporal_coords = None, None
-        # if self.use_metadata:
-        #     location_coords = self._get_coords(image)
-        #     metadata_idx = self.image_to_metadata_index.get(index, None)
-        #     if metadata_idx is not None:
-        #         row = self.metadata.iloc[metadata_idx]
-        #         temporal_coords = self._get_date(row)
-
-        # # to channels last
-        # image = image.to_numpy()
-        # if self.expand_temporal_dimension:
-        #     image = rearrange(image, "(time channels) h w -> channels time h w", channels=len(self.bands))
-        # image = np.moveaxis(image, 0, -1)
-
-        # # filter bands
-        # image = image[..., self.band_indices]
-
+        # 处理标签：转换为 numpy 数组
+        if hasattr(mask_data, 'to_numpy'):
+            # xarray DataArray
+            mask = mask_data.to_numpy()[0].astype(np.int64)
+        else:
+            # 已经是 numpy array
+            mask = mask_data.astype(np.int64)
         
-        # 1. 读取标签 Mask (确保路径转换为标准字符串型，防止 Path 对象传进 C++ 乱码)
-        import rasterio
-        from rasterio.env import Env
-
-        # 用 rasterio 的本地 path 处理来避免编码问题
-        label_path = str(sample_info["label_path"])
-
-        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN='YES', GDAL_CACHEMAX=0):
-            mask_data = rioxarray.open_rasterio(label_path, masked=True)
-        if self.no_label_replace is not None:
-            mask_data = mask_data.fillna(self.no_label_replace)
-        mask = mask_data.to_numpy()[0].astype(np.int64) # 取出第一通道，形状变成 [H, W]
-
         # 2. 循环读取 12 幅影像
         time_series_list = []
         for img_path in sample_info["image_paths"]:
-            img_da = rioxarray.open_rasterio(str(img_path), masked=True)
-            if self.no_data_replace is not None:
-                img_da = img_da.fillna(self.no_data_replace)
-            
-            img_np = img_da.to_numpy() # 形状: [10, H, W]
-            # 【核心修改】只切取前 6 个波段，满足 Prithvi 模型要求
-            img_np = img_np[:6, :, :] # 形状变成 [6, H, W]
-            time_series_list.append(img_np)
+            try:
+                with rasterio.Env(
+                    GDAL_DISABLE_READDIR_ON_OPEN='YES',
+                    GDAL_CACHEMAX=0,
+                    GDAL_NUM_THREADS='1',
+                    CPL_DEBUG=False
+                ):
+                    old_logger = logging.getLogger('rasterio._env')
+                    old_level = old_logger.level
+                    old_logger.setLevel(logging.CRITICAL)
+                    old_logger.disabled = True
+                    
+                    try:
+                        img_da = rioxarray.open_rasterio(str(img_path), masked=True)
+                    finally:
+                        old_logger.disabled = False
+                        old_logger.setLevel(old_level)
+                        
+                if self.no_data_replace is not None:
+                    img_da = img_da.fillna(self.no_data_replace)
+                
+                img_np = img_da.to_numpy() # 形状: [10, H, W]
+                # 【核心���改】只切取前 6 个波段，满足 Prithvi 模型要求
+                img_np = img_np[:6, :, :] # 形状变成 [6, H, W]
+                time_series_list.append(img_np)
+            except Exception as e:
+                print(f"Error reading image {img_path}: {e}")
+                raise
 
         # 堆叠 12 个时相： 形状从 list 变为 [12, 6, H, W]
         image = np.stack(time_series_list, axis=0)
@@ -385,22 +378,6 @@ class MultiTemporalCropClassification(NonGeoDataset):
         image = rearrange(image, "time channels h w -> (time channels) h w")
         # 换轴为 channels_last: [H, W, 72]
         image = np.moveaxis(image, 0, -1).astype(np.float32)
-
-        # # ─── 寻找原代码中获取到 img 的位置 ───
-        # # 假设此时 img 的形状是 (120, 224, 224)，即 12时相 * 10波段
-        # # 或者是 (12, 10, 224, 224)
-
-        # # 强制重塑为 [时间, 波段, H, W]
-        # H, W = image.shape[-2], image.shape[-1]
-        # image = image.reshape(12, 10, H, W)     
-
-        # # 【核心修改】挑选出符合 Prithvi 要求的 6 个波段索引
-        # # 这里的 [0, 1, 2, 3, 4, 5] 需要替换为你数据中 B, G, R, NIR, SWIR1, SWIR2 真实的索引位置
-        # selected_indices = [0, 1, 2, 3, 4, 5] 
-        # image = image[:, selected_indices, :, :]  # 裁剪后变为 [12, 6, 224, 224]
-
-        # # 如果后续原代码期望的形状是平铺的 (72, 224, 224)
-        # image = image.reshape(-1, H, W) 
 
         output = {
             "image": image,
@@ -437,22 +414,25 @@ class MultiTemporalCropClassification(NonGeoDataset):
         """
         num_images = self.time_steps + 2
 
-        rgb_indices = [self.bands.index(band) for band in self.rgb_bands]
+        rgb_indices = [self.all_band_names.index(band) for band in self.all_band_names[:3]]
         if len(rgb_indices) != 3:
             msg = "Dataset doesn't contain some of the RGB bands"
             raise ValueError(msg)
 
         images = sample["image"]
-        images = images[rgb_indices, ...]  # Shape: (T, 3, H, W)
+        # 重塑为 [H, W, 72]，选取前 3 个波段的 RGB
+        # images 原形状是 [H, W, 72]，其中前 6 个是 t=0 的所有波段
+        images = images.reshape(-1, -1, self.time_steps, 6)  # [H, W, 12, 6]
+        images = images[..., :3]  # [H, W, 12, 3] - 取前 3 个波段（B, G, R）
+        images = np.transpose(images, (2, 0, 1, 3))  # [12, H, W, 3]
 
         processed_images = []
         for t in range(self.time_steps):
-            img = images[:, t]
-            img = img.numpy()
-            img = to_rgb(img, rgb_indices, gamma=0.9)
+            img = images[t]  # [H, W, 3]
+            img = img.astype(np.uint8) if img.max() > 1 else (img * 255).astype(np.uint8)
             processed_images.append(img)
 
-        mask = sample["mask"].numpy()
+        mask = sample["mask"].numpy() if isinstance(sample["mask"], torch.Tensor) else sample["mask"]
         if "prediction" in sample:
             num_images += 1
         fig, ax = plt.subplots(1, num_images, figsize=(12, 5), layout="compressed")
