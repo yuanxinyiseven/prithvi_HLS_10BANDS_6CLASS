@@ -39,6 +39,19 @@ class MultiTemporalCropClassification(NonGeoDataset):
     """NonGeo dataset implementation for [multi-temporal crop classification](https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification)."""
     """
     针对 HLS 10波段、12时相数据定制的 Dataset
+    
+    Prithvi 模型期望的输入格式: [B, C, T, H, W]
+    
+    数据流程说明:
+    1. Dataset 返回单个样本:
+       - image: [6, 12, 224, 224]  <- [C, T, H, W]
+       - mask: [224, 224]           <- [H, W]
+    
+    2. DataLoader Batch 处理:
+       - images: [B, 6, 12, 224, 224]  <- [B, C, T, H, W]
+       - masks: [B, 224, 224]          <- [B, H, W]
+    
+    这个格式可以直接输入到 Prithvi 模型!
     """
     # 显式指出前 6 个波段名（对应 Prithvi 所需的 B, G, R, NIR, SWIR1, SWIR2）
     all_band_names = (
@@ -65,6 +78,7 @@ class MultiTemporalCropClassification(NonGeoDataset):
 
     num_classes = 6
     time_steps = 12
+    num_bands = 6
     # splits = {"train": "training", "val": "validation"}  # Only train and val splits available
     # col_name = "chip_id"
     # date_columns = ["first_img_date", "middle_img_date", "last_img_date"]
@@ -336,15 +350,15 @@ class MultiTemporalCropClassification(NonGeoDataset):
                 print(f"Error reading image {img_path}: {e}")
                 raise
 
-        # 堆叠 12 个时相： 形状从 list 变为 [12, 6, H, W]
+        # 堆叠 12 个时相
+        # time_series_list: 12 个 [6, H, W]
+        # stack 后: [12, 6, H, W]
         image = np.stack(time_series_list, axis=0)
-
-        # 准备进行 Albumentations 变换
-        # Albumentations 要求输入形状为 [H, W, Channels]
-        # 先利用 einops 平铺时序通道：[12, 6, H, W] -> [72, H, W]
-        image = rearrange(image, "time channels h w -> (time channels) h w")
-        # 换轴为 channels_last: [H, W, 72]
-        image = np.moveaxis(image, 0, -1).astype(np.float32)
+        
+        # 【核心修改】转换为 Prithvi 期望的格式 [C, T, H, W]
+        # 当前: [12, 6, H, W] 即 [T, C, H, W]
+        # 目标: [6, 12, H, W] 即 [C, T, H, W]
+        image = np.transpose(image, (1, 0, 2, 3)).astype(np.float32)
 
         output = {
             "image": image,
@@ -381,54 +395,66 @@ class MultiTemporalCropClassification(NonGeoDataset):
         Returns:
             a matplotlib Figure with the rendered sample
         """
-        num_images = self.time_steps + 2
-
-        rgb_indices = [self.all_band_names.index(band) for band in self.all_band_names[:3]]
-        if len(rgb_indices) != 3:
-            msg = "Dataset doesn't contain some of the RGB bands"
-            raise ValueError(msg)
-
+        # 处理不同的输入格式
         images = sample["image"]
-        # 重塑为 [H, W, 72]，选取前 3 个波段的 RGB
-        # images 原形状是 [H, W, 72]，其中前 6 个是 t=0 的所有波段
-        images = images.reshape(-1, -1, self.time_steps, 6)  # [H, W, 12, 6]
-        images = images[..., :3]  # [H, W, 12, 3] - 取前 3 个波段（B, G, R）
-        images = np.transpose(images, (2, 0, 1, 3))  # [12, H, W, 3]
-
-        processed_images = []
-        for t in range(self.time_steps):
-            img = images[t]  # [H, W, 3]
-            img = img.astype(np.uint8) if img.max() > 1 else (img * 255).astype(np.uint8)
-            processed_images.append(img)
-
-        mask = sample["mask"].numpy() if isinstance(sample["mask"], torch.Tensor) else sample["mask"]
+        mask = sample["mask"]
+        
+        # 如果是 Tensor，转换为 numpy
+        if isinstance(images, torch.Tensor):
+            images = images.cpu().numpy()
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy()
+        
+        # 期望格式：[C, T, H, W] = [6, 12, 224, 224]
+        # 取第一个时间步的前 3 个波段作为 RGB
+        if images.ndim == 4 and images.shape[0] == self.num_bands and images.shape[1] == self.time_steps:
+            # [C, T, H, W] 格式
+            img_rgb = images[:3, 0, :, :]  # [3, H, W] - 前 3 个波段，第一个时间步
+            img_rgb = np.transpose(img_rgb, (1, 2, 0))  # [H, W, 3]
+        else:
+            raise ValueError(f"Expected image shape [C, T, H, W] = [6, 12, H, W], but got {images.shape}")
+        
+        # 归一化到 [0, 255]
+        if img_rgb.max() <= 1.0:
+            img_rgb = (img_rgb * 255).astype(np.uint8)
+        else:
+            img_rgb = img_rgb.astype(np.uint8)
+        
+        # 绘制
+        num_images = 3
         if "prediction" in sample:
             num_images += 1
+        
         fig, ax = plt.subplots(1, num_images, figsize=(12, 5), layout="compressed")
+        
+        # RGB 图
         ax[0].axis("off")
-
+        ax[0].title.set_text("RGB Image (T=0)")
+        ax[0].imshow(img_rgb)
+        
+        # Ground Truth Mask
         norm = mpl.colors.Normalize(vmin=0, vmax=self.num_classes - 1)
-        for i, img in enumerate(processed_images):
-            ax[i + 1].axis("off")
-            ax[i + 1].title.set_text(f"T{i}")
-            ax[i + 1].imshow(img)
-
-        ax[self.time_steps + 1].axis("off")
-        ax[self.time_steps + 1].title.set_text("Ground Truth Mask")
-        ax[self.time_steps + 1].imshow(mask, cmap="jet", norm=norm)
-
-        if "prediction" in sample:
-            prediction = sample["prediction"]
-            ax[self.time_steps + 2].axis("off")
-            ax[self.time_steps + 2].title.set_text("Predicted Mask")
-            ax[self.time_steps + 2].imshow(prediction, cmap="jet", norm=norm)
-
+        ax[1].axis("off")
+        ax[1].title.set_text("Ground Truth Mask")
+        ax[1].imshow(mask, cmap="jet", norm=norm)
+        
+        # 图例
         cmap = plt.get_cmap("jet")
         legend_data = [[i, cmap(norm(i)), self.class_names[i]] for i in range(self.num_classes)]
         handles = [Rectangle((0, 0), 1, 1, color=tuple(v for v in c)) for k, c, n in legend_data]
         labels = [n for k, c, n in legend_data]
-        ax[0].legend(handles, labels, loc="center")
-
+        ax[2].axis("off")
+        ax[2].legend(handles, labels, loc="center", fontsize=10)
+        
+        # 预测结果（如果有）
+        if "prediction" in sample:
+            prediction = sample["prediction"]
+            if isinstance(prediction, torch.Tensor):
+                prediction = prediction.cpu().numpy()
+            ax[3].axis("off")
+            ax[3].title.set_text("Predicted Mask")
+            ax[3].imshow(prediction, cmap="jet", norm=norm)
+        
         if suptitle is not None:
             plt.suptitle(suptitle)
 
